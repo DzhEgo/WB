@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gorilla/mux"
+	"github.com/nats-io/stan.go"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"html/template"
 	"log"
 	"net/http"
+	"sync"
 )
 
 type Delivery struct {
@@ -72,14 +75,36 @@ type Orders struct {
 	OofShard          string   `json:"oof_shard"`
 }
 
+type Cache struct {
+	data  map[string]*Orders
+	mutex sync.RWMutex
+}
+
 var db *gorm.DB
+var cache *Cache
+
+func ConnectNats() (stan.Conn, error) {
+	natsURL := stan.DefaultNatsURL
+	sc, err := stan.Connect("nats-Max", "DzhEgo", stan.NatsURL(natsURL))
+	if err != nil {
+		return nil, err
+	}
+	return sc, nil
+}
+
+func SubdcribeToChan(sc stan.Conn, subject string, cb stan.MsgHandler) (stan.Subscription, error) {
+	subscription, err := sc.Subscribe(subject, cb)
+	if err != nil {
+		return nil, err
+	}
+	return subscription, nil
+}
 
 func StartServer() {
 	r := mux.NewRouter()
 	r.HandleFunc("/order", AddHandler).Methods("POST")
-	r.HandleFunc("/order", AllHandler).Methods("GET")
 	r.HandleFunc("/order/{id}", FindByIdHandler).Methods("GET")
-
+	r.HandleFunc("/order", PageIdHandler).Methods("GET")
 	err := http.ListenAndServe(":8080", r)
 	if err != nil {
 		log.Fatal(err)
@@ -88,6 +113,7 @@ func StartServer() {
 
 func main() {
 	var err error
+
 	dsn := "user=postgres password=Lax212212 dbname=test_stream sslmode=disable"
 	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
@@ -95,8 +121,53 @@ func main() {
 	}
 	db.AutoMigrate(&Orders{}, &Delivery{}, &Items{}, &Payment{})
 
+	cache = NewCache()
+	if err := LoadCache(db, cache); err != nil {
+		log.Fatalf("Ошибка загрузки кэша из БД: %v", err)
+	}
+
+	//sc, err := ConnectNats()
+	//if err != nil {
+	//	log.Fatalf("Ошибка с подключением к NATS Streaming", err)
+	//}
+	//defer sc.Close()
+
+	//_, err = SubdcribeToChan(sc, "Test", messageHandler)
+	//if err != nil {
+	//	log.Fatalf("Ошибка подписки на канал: %v", err)
+	//}
+
 	fmt.Println("Запуск сервера...")
 	StartServer()
+}
+
+func NewCache() *Cache {
+	return &Cache{data: make(map[string]*Orders)}
+}
+
+func (c *Cache) SetCache(key string, order *Orders) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.data[key] = order
+}
+
+func (c *Cache) GetCache(key string) (*Orders, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	order, exists := c.data[key]
+	return order, exists
+}
+
+func LoadCache(db *gorm.DB, cache *Cache) error {
+	var orders []Orders
+	if err := db.Find(&orders).Error; err != nil {
+		return err
+	}
+
+	for _, order := range orders {
+		cache.SetCache(order.OrderUID, &order)
+	}
+	return nil
 }
 
 func AddHandler(w http.ResponseWriter, r *http.Request) {
@@ -115,21 +186,11 @@ func AddHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cacheKey := order.OrderUID
+	cache.SetCache(cacheKey, &order)
+
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode("Данные записаны!")
-}
-
-func AllHandler(w http.ResponseWriter, r *http.Request) {
-	var order []Orders
-	res := db.Find(&order)
-	if res.Error != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(order)
 }
 
 func FindByIdHandler(w http.ResponseWriter, r *http.Request) {
@@ -141,7 +202,13 @@ func FindByIdHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res := db.Preload("Deliveries").Preload("Payments").Preload("Items").First(&order, "id = ?", id)
+	if cachedOrder, exists := cache.GetCache(id); exists {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cachedOrder)
+		return
+	}
+
+	res := db.Preload("Delivery").Preload("Payment").Preload("Items").First(&order, "order_uid = ?", id)
 	if res.Error != nil {
 		if errors.Is(res.Error, gorm.ErrRecordNotFound) {
 			http.Error(w, "Данные с этим ID не найдены", http.StatusNotFound)
@@ -151,7 +218,28 @@ func FindByIdHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cache.SetCache(id, &order)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(order)
+}
+
+func PageIdHandler(w http.ResponseWriter, r *http.Request) {
+	page := template.Must(template.ParseFiles("index.html"))
+
+	orderId := r.URL.Query().Get("id")
+	var order Orders
+	var data = struct {
+		Order *Orders
+	}{}
+
+	if orderId != "" {
+		res := db.Preload("Delivery").Preload("Payment").Preload("Items").First(&order, "order_uid = ?", orderId)
+		if res.Error == nil {
+			data.Order = &order
+		}
+	}
+
+	page.Execute(w, data)
 }

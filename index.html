@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Поиск Заказа</title>
+</head>
+<body>
+<h1>Поиск Заказа</h1>
+<form method="GET" action="/order">
+    <input type="text" name="id" placeholder="Введите ID заказа">
+    <button type="submit">Поиск</button>
+</form>
+{{if .Order}}
+<pre>{{.Order}}</pre>
+{{else}}
+<p>Введите ID для поиска заказа.</p>
+{{end}}
+</body>
+</html>
