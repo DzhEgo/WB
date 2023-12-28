@@ -85,19 +85,54 @@ var cache *Cache
 
 func ConnectNats() (stan.Conn, error) {
 	natsURL := stan.DefaultNatsURL
-	sc, err := stan.Connect("nats-Max", "DzhEgo", stan.NatsURL(natsURL))
+	sc, err := stan.Connect("test-cluster", "DzhEgo", stan.NatsURL(natsURL))
 	if err != nil {
 		return nil, err
 	}
 	return sc, nil
 }
 
-func SubdcribeToChan(sc stan.Conn, subject string, cb stan.MsgHandler) (stan.Subscription, error) {
+func SubcribeToChan(sc stan.Conn, subject string, cb stan.MsgHandler) (stan.Subscription, error) {
 	subscription, err := sc.Subscribe(subject, cb)
 	if err != nil {
 		return nil, err
 	}
 	return subscription, nil
+}
+
+func messageHandler(m *stan.Msg) {
+
+	dsn := "user=postgres password=Lax212212 dbname=test_stream sslmode=disable"
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	db.AutoMigrate(&Orders{}, &Delivery{}, &Items{}, &Payment{})
+
+	log.Printf("Получено сообщение: [%s] %s", m.Subject, string(m.Data))
+
+	log.Printf("Проверка содержимого сообщения...")
+	if len(m.Data) == 0 {
+		log.Printf("Сообщение пустое!")
+		return
+	}
+
+	var order Orders
+	err = json.Unmarshal(m.Data, &order)
+	if err != nil {
+		log.Printf("Ошибка десериализации сообщения: %v", err)
+		return
+	}
+
+	log.Printf("Сообщение десериализовано в заказ с OrderUID: %s", order.OrderUID)
+
+	if err = db.Create(&order).Error; err != nil {
+		log.Printf("Ошибка сохранения заказа в БД: %v", err)
+		return
+	}
+
+	log.Printf("Заказ сохранен в БД с OrderUID: %s", order.OrderUID)
+	cache.SetCache(order.OrderUID, &order)
 }
 
 func StartServer() {
@@ -126,16 +161,16 @@ func main() {
 		log.Fatalf("Ошибка загрузки кэша из БД: %v", err)
 	}
 
-	//sc, err := ConnectNats()
-	//if err != nil {
-	//	log.Fatalf("Ошибка с подключением к NATS Streaming", err)
-	//}
-	//defer sc.Close()
+	sc, err := ConnectNats()
+	if err != nil {
+		log.Fatalf("Ошибка с подключением к NATS Streaming", err)
+	}
+	defer sc.Close()
 
-	//_, err = SubdcribeToChan(sc, "Test", messageHandler)
-	//if err != nil {
-	//	log.Fatalf("Ошибка подписки на канал: %v", err)
-	//}
+	_, err = SubcribeToChan(sc, "Test", messageHandler)
+	if err != nil {
+		log.Fatalf("Ошибка подписки на канал: %v", err)
+	}
 
 	fmt.Println("Запуск сервера...")
 	StartServer()
@@ -165,7 +200,8 @@ func LoadCache(db *gorm.DB, cache *Cache) error {
 	}
 
 	for _, order := range orders {
-		cache.SetCache(order.OrderUID, &order)
+		orderCopy := order
+		cache.SetCache(order.OrderUID, &orderCopy)
 	}
 	return nil
 }
@@ -227,17 +263,21 @@ func FindByIdHandler(w http.ResponseWriter, r *http.Request) {
 
 func PageIdHandler(w http.ResponseWriter, r *http.Request) {
 	page := template.Must(template.ParseFiles("index.html"))
-
 	orderId := r.URL.Query().Get("id")
-	var order Orders
 	var data = struct {
 		Order *Orders
 	}{}
 
 	if orderId != "" {
-		res := db.Preload("Delivery").Preload("Payment").Preload("Items").First(&order, "order_uid = ?", orderId)
-		if res.Error == nil {
-			data.Order = &order
+		if cachedOrder, exists := cache.GetCache(orderId); exists {
+			data.Order = cachedOrder
+		} else {
+			var order Orders
+			res := db.Preload("Delivery").Preload("Payment").Preload("Items").First(&order, "order_uid = ?", orderId)
+			if res.Error == nil {
+				data.Order = &order
+				cache.SetCache(orderId, &order)
+			}
 		}
 	}
 
