@@ -1,29 +1,32 @@
-package main
+package service
 
 import (
-	"fmt"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go"
 	"log"
 )
 
-func main() {
-	url := "localhost"
-	log.Println("Подключение...")
-
-	nc, err := nats.Connect(url)
+func ConnectNATS(clusterID, clientID, natsURL string) (stan.Conn, error) {
+	sc, err := stan.Connect(clusterID, clientID, stan.NatsURL(natsURL))
 	if err != nil {
-		log.Fatal(err)
-
+		return nil, err
 	}
-	defer nc.Close()
+	return sc, nil
+}
 
-	_, err = nc.Subscribe("app", func(msg *nats.Msg) {
-		fmt.Println("Сообщение NATS: %s\n", string(msg.Data))
-	})
+func SubscribeToNATS(sc stan.Conn, subject string, cb stan.MsgHandler) (stan.Subscription, error) {
+	sub, err := sc.Subscribe(subject, cb, stan.DurableName("God"))
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
+	}
+	return sub, nil
+}
+
+func Publish(sc stan.Conn, subject, message string) {
+	if sc == nil {
+		log.Println("NATS Streaming соединение не инициализировано")
 		return
 	}
-
-	select {}
+	if err := sc.Publish(subject, []byte(message)); err != nil {
+		log.Printf("Ошибка публикации сообщения в NATS Streaming: %v\n", err)
+	}
 }
